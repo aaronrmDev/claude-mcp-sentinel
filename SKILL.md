@@ -1,14 +1,19 @@
 ---
 name: mcp-sentinel
+version: "2.0.0"
 description: >
-  Security monitoring agent for Claude Skills and MCP servers. Scans your project's installed
-  skills/MCPs against multiple vulnerability databases (GitHub Advisory DB, vulnerablemcp.info,
-  CVE feeds, mcpscan.ai, Snyk, ClawHub/VirusTotal), community alerts (Reddit r/ClaudeAI, Discord),
-  and known threat patterns. Maintains a local threat database that grows over time. Use this skill
-  whenever: the user asks about security of their skills or MCPs, wants to audit installed plugins,
-  mentions "vulnerability", "CVE", "malicious skill", "security scan", "threat", "audit", says
-  "is this skill safe?", asks to check dependencies, or wants ongoing security monitoring. Also
-  trigger proactively when the user is about to install a new skill or MCP server.
+  Security monitoring agent for Claude Skills and MCP servers. v2 adds a real-time protection
+  layer (PreToolUse hook) that blocks malicious tool calls — credential exfiltration, known-bad
+  domains like giftshop.club (Postmark MCP incident), reverse shells, curl|bash pipes — BEFORE
+  they execute, with zero LLM cost. v1 static analysis still runs: scans installed skills/MCPs
+  against multiple vulnerability databases (GitHub Advisory DB, vulnerablemcp.info, CVE feeds,
+  mcpscan.ai, Snyk, ClawHub/VirusTotal) and community alerts (Reddit r/ClaudeAI, Discord),
+  maintains a local threat database, performs coherence analysis and update diff detection.
+  Use this skill whenever: the user asks about security of their skills or MCPs, wants to
+  audit installed plugins, enable real-time protection, mentions "vulnerability", "CVE",
+  "malicious skill", "security scan", "threat", "audit", "runtime protection", "block", says
+  "is this skill safe?", asks to check dependencies, or wants ongoing security monitoring.
+  Also trigger proactively when the user is about to install a new skill or MCP server.
 ---
 
 # MCP Sentinel — Security Monitor for Skills & MCP Servers
@@ -25,6 +30,109 @@ skills contain security flaws, over 138 CVEs have been tracked, and thousands of
 have been identified on registries like ClawHub. A single compromised skill can exfiltrate API keys,
 inject malicious code, or escalate privileges. This skill exists so the user doesn't have to
 manually track all of this — you do it for them.
+
+The Postmark MCP incident (September 2025) is the canonical example: a skill that was clean and
+trusted for fifteen versions shipped a single-line update (v1.0.16) that silently BCC'd every email
+the user sent to `phan@giftshop.club`. Static scans of the original v1.0.15 would have found nothing.
+This is why Sentinel v2 adds a second, live layer: a PreToolUse hook that inspects tool calls **at
+the moment they're about to execute**, not just when they're installed.
+
+## Runtime protection layer (v2)
+
+Sentinel v2 ships a PreToolUse hook (`hooks/sentinel_preflight.py`) that Claude Code runs before
+every tool call a skill or MCP tries to make. The hook reads the tool call JSON on stdin, checks
+it against the bundled IOC library (`references/iocs.json`) plus the user's allowlist, and returns
+an allow/deny decision on stdout. Blocked calls never reach the target tool — Claude sees the
+block, explains it to the user, and stops.
+
+**What it catches, live:**
+
+- **Sensitive paths** — any read or shell access touching `~/.ssh/`, `~/.aws/`, `~/.env`,
+  `~/.gnupg/`, `~/.kube/config`, `/etc/shadow`, `credentials.json`, `*.env`, etc.
+- **Sensitive env vars** — commands that dereference `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
+  `GITHUB_TOKEN`, `STRIPE_SECRET_KEY`, `DATABASE_URL`, and the generic `*_API_KEY` / `*_SECRET` /
+  `*_TOKEN` / `*_PASSWORD` patterns.
+- **Known-malicious domains** — hardcoded IOCs from confirmed incidents, e.g. `giftshop.club`
+  (Postmark MCP backdoor). These have no allowlist override — you cannot accidentally whitelist
+  a known exfil endpoint.
+- **Exfiltration vectors** — pastebin-style services (pastebin.com, transfer.sh, 0x0.st, file.io,
+  webhook.site, requestbin, ngrok, serveo) and raw IP URLs with no domain.
+- **Dangerous shell patterns** — `curl ... | bash`, `wget ... | sh`, `nc -e`, `bash -i >& /dev/tcp/...`,
+  base64 | curl chains, `eval`/`exec` at the start of a command, `chmod 777`, appends to `~/.bashrc`.
+
+**Cost.** Zero LLM tokens in normal operation. The hook is local Python, ~30–80ms per call. Only
+a short message gets added to context when something is actually blocked.
+
+**Failure mode.** Fail-open. If the IOCs file is missing, stdin is malformed, or the hook crashes,
+the decision defaults to `allow` — protecting Claude Code from being broken by Sentinel itself.
+The trade-off is intentional: a missed detection is annoying, but a broken Claude Code is worse.
+
+### When to offer the runtime hook
+
+Offer to install the hook whenever:
+
+- The user asks for "real-time", "runtime", "active", or "live" protection.
+- The user asks about blocking malicious skills/MCPs, not just detecting them.
+- You just found a threat during a v1 scan and the user wants stronger defence going forward.
+- The user mentions the Postmark incident, supply-chain attacks, or trusted skills going bad.
+- The user is installing a skill from an unverified source and wants belt-and-braces.
+
+If it looks like the right move and the user hasn't already enabled it, proactively say:
+*"Sentinel v2 includes a runtime hook that would have blocked this at execution time, with zero
+extra LLM cost. Want me to install it?"*
+
+### Installing the hook
+
+Run the bundled installer. User scope (global, recommended):
+
+```bash
+bash hooks/install_hooks.sh --user
+```
+
+Project scope only:
+
+```bash
+bash hooks/install_hooks.sh --project
+```
+
+The installer is idempotent, validates existing JSON, keeps a timestamped backup of
+`settings.json`, and preserves any other PreToolUse hooks the user already has.
+
+### Allowlisting false positives
+
+Users can whitelist paths, domains, and commands in `.security/sentinel-allowlist.json`
+(project) or `~/.claude/sentinel-allowlist.json` (global):
+
+```json
+{
+  "paths": ["/home/me/project/.env.local"],
+  "domains": ["api.mytrustedservice.com"],
+  "commands": ["curl -X POST https://api.mytrustedservice.com/webhook"]
+}
+```
+
+The user allowlist is additive to the bundled `iocs.json` allowlist (which covers
+`api.anthropic.com`, `github.com`, `api.github.com`, `raw.githubusercontent.com`,
+`registry.npmjs.org`, `pypi.org`, `files.pythonhosted.org`). Known-malicious domains
+from confirmed incidents are **never** overrideable.
+
+### When a block fires
+
+Claude Code will show the user a `🛡️ MCP Sentinel blocked a <tool> call.` message with
+the reason. Your job in that moment: explain *why* in plain language, name the skill/MCP
+that tried to make the call if you can identify it from the conversation, and ask the user
+whether they want to (a) uninstall the offending skill, (b) investigate further with a v1
+deep scan, or (c) add a targeted allowlist entry if they're sure it's a false positive.
+Never auto-allowlist.
+
+### Uninstalling
+
+```bash
+bash hooks/uninstall_hooks.sh --user       # or --project
+```
+
+This removes only Sentinel's hook entries. Any other PreToolUse hooks the user registered
+are preserved.
 
 ## Core workflow
 
@@ -513,4 +621,34 @@ This skill works in both Claude Code (terminal) and Cowork (desktop). It uses:
 - **Bash** — for file discovery and any scripting needs
 - **Glob/Grep** — for finding skill and MCP configuration files
 
-No external dependencies or API keys required. Everything runs through Claude's built-in tools.
+The v2 runtime hook additionally requires:
+- **Python 3** — to execute `hooks/sentinel_preflight.py`
+- **jq** — used by `hooks/install_hooks.sh` to safely patch `settings.json`
+
+Both are available by default on macOS (jq via Homebrew) and most Linux distros. Windows users
+can run under WSL. If either is missing, the installer explains what to install.
+
+No external dependencies or API keys required. Everything runs through Claude's built-in tools
+plus local Python for the hook. No network requests are made by the hook itself.
+
+## Layout
+
+```
+mcp-sentinel/
+├── SKILL.md                         # this file — the skill instructions
+├── README.md                        # user-facing overview
+├── CHANGELOG.md                     # version history
+├── LICENSE                          # MIT
+├── hooks/                           # v2 runtime protection
+│   ├── sentinel_preflight.py        # the PreToolUse hook
+│   ├── install_hooks.sh             # register the hook in settings.json
+│   ├── uninstall_hooks.sh           # remove the hook
+│   └── README.md                    # hook-specific docs
+├── references/
+│   ├── iocs.json                    # v2 indicator library (paths, domains, commands, env vars)
+│   ├── threat-sources.md            # v1 reference list of vulnerability databases
+│   └── threat-db-template.json      # v1 local threat DB schema
+└── tests/
+    └── test_hook.py                 # subprocess-based hook regression tests
+```
+
